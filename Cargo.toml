@@ -1,0 +1,29 @@
+[package]
+name = "libre-semif-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Direct option-logit scorer using llama.cpp on Metal"
+license = "MIT"
+publish = false
+
+[lib]
+name = "semif_score"
+path = "src/lib.rs"
+
+[[bin]]
+name = "libre-semif-rs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "=4.6.7", features = ["derive"] }
+hex = "=0.4.3"
+hf-hub = { version = "=1.0.0", features = ["blocking"] }
+# Metal is required. Default features pull OpenMP, which is unnecessary when every layer is offloaded.
+llama-cpp-2 = { version = "=0.1.157", default-features = false, features = ["metal"] }
+minijinja = { version = "=2.24.0", features = ["json", "serde"] }
+minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+sha2 = "=0.11.0"
+thiserror = "=2.0.21"
+tokenizers = "=0.23.2"
