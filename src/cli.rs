@@ -15,7 +15,7 @@ use crate::row::validate_row;
 #[derive(Parser, Debug)]
 #[command(
     name = "libre-semif-rs",
-    about = "Score declared options from llama.cpp last-position logits on Metal"
+    about = "Score declared options from llama.cpp last-position logits"
 )]
 struct Args {
     /// Scoring mode. Only direct is implemented.

@@ -1564,6 +1564,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "minijinja",
  "minijinja-contrib",
  "serde",

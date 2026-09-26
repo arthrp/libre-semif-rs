@@ -48,7 +48,10 @@ impl Session {
         let mut model = self.metadata.as_object().cloned().unwrap_or_default();
         model.insert(
             "serving_config".to_string(),
-            json!("llamacpp-metal-direct-v1"),
+            json!(format!(
+                "llamacpp-{}-direct-v1",
+                self.scoring_backend().name()
+            )),
         );
         let status = if self.quantized() {
             STATUS_QUANTIZED

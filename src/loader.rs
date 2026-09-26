@@ -1,4 +1,4 @@
-//! Load a pinned Hugging Face tokenizer and a local GGUF checkpoint onto Metal.
+//! Load a pinned Hugging Face tokenizer and a local GGUF checkpoint.
 
 use std::fs::File;
 use std::io::Read;
@@ -26,7 +26,7 @@ pub const LLAMA_CPP_2_VERSION: &str = "0.1.157";
 pub const TOKENIZERS_VERSION: &str = "0.23.2";
 pub const MINIJINJA_VERSION: &str = "2.24.0";
 
-/// A loaded GGUF model, its reference tokenizer, and one Metal context.
+/// A loaded GGUF model, its reference tokenizer, and one llama.cpp context.
 ///
 /// `LlamaContext` borrows the model. The model is boxed so that address stays
 /// stable when this value is moved. The context is freed before the model, and
@@ -37,6 +37,7 @@ pub struct Session {
     /// Process-wide llama.cpp backend. Stored so it outlives the context; Drop frees the context first.
     #[allow(dead_code)]
     backend: LlamaBackend,
+    scoring: Backend,
     tokenizer: ReferenceTokenizer,
     pub metadata: Value,
     quantized: bool,
@@ -66,6 +67,10 @@ impl Session {
     pub(crate) fn gguf_tokenize(&self, text: &str) -> Result<Vec<i32>, Error> {
         tokenize_with(&self.model, text)
     }
+
+    pub(crate) fn scoring_backend(&self) -> Backend {
+        self.scoring
+    }
 }
 
 pub fn load_model(
@@ -86,10 +91,9 @@ pub fn load_model(
     if context_tokens == 0 {
         return Err(Error::new("context_tokens must be a positive integer"));
     }
-    if !host_is_apple_silicon() {
-        return Err(Error::new(
-            "llama.cpp Metal backend requires macOS on Apple Silicon",
-        ));
+    let scoring = compiled_backend();
+    if !host_backend_supported(std::env::consts::OS, std::env::consts::ARCH, scoring) {
+        return Err(unsupported_host(scoring));
     }
     // Hash and parse before any llama.cpp allocation.
     let (sha256, bytes) = hash_file(gguf)?;
@@ -98,11 +102,8 @@ pub fn load_model(
 
     let backend = LlamaBackend::init()
         .map_err(|error| Error::new(format!("llama.cpp backend failed to initialize: {error}")))?;
-    if !backend.supports_gpu_offload() {
-        return Err(Error::new("llama.cpp Metal GPU offload is unavailable"));
-    }
-    // Default n_gpu_layers is -1, which offloads every layer.
-    let params = LlamaModelParams::default();
+    require_offload(&backend, scoring)?;
+    let params = model_params(scoring);
     let model = LlamaModel::load_from_file(&backend, gguf, &params).map_err(|error| {
         Error::new(format!(
             "llama.cpp failed to load the GGUF checkpoint {}: {error}",
@@ -141,7 +142,10 @@ pub fn load_model(
     let mut metadata = Map::new();
     metadata.insert("source".to_string(), json!(source));
     metadata.insert("revision".to_string(), json!(revision));
-    metadata.insert("backend".to_string(), json!("llamacpp-metal"));
+    metadata.insert(
+        "backend".to_string(),
+        json!(format!("llamacpp-{}", scoring.name())),
+    );
     metadata.insert("dtype".to_string(), json!(dtype_name(&info)));
     metadata.insert(
         "gguf".to_string(),
@@ -153,7 +157,10 @@ pub fn load_model(
     );
     metadata.insert("vocab_size".to_string(), json!(model.n_vocab()));
     metadata.insert("threads".to_string(), json!(threads));
-    metadata.insert("n_gpu_layers".to_string(), json!(model.n_layer()));
+    metadata.insert(
+        "n_gpu_layers".to_string(),
+        json!(offloaded_layers(&model, scoring)),
+    );
     metadata.insert("max_prompt_tokens".to_string(), json!(context_tokens));
     metadata.insert("context_tokens".to_string(), json!(actual_context));
     metadata.insert(
@@ -170,6 +177,7 @@ pub fn load_model(
         context,
         model,
         backend,
+        scoring,
         tokenizer,
         metadata: Value::Object(metadata),
         quantized: info.quantized,
@@ -211,12 +219,113 @@ fn resolve_threads(threads: Option<i32>) -> Result<i32, Error> {
     }
 }
 
-pub fn host_is_apple_silicon() -> bool {
-    metal_host_supported(cfg!(target_os = "macos"), cfg!(target_arch = "aarch64"))
+/// llama.cpp backend selected for this build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Metal,
+    // Constructed only when this build selects that backend. Tests still name every variant.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "vulkan", not(feature = "cpu"))),
+        allow(dead_code)
+    )]
+    Vulkan,
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "cpu", not(feature = "vulkan"))),
+        allow(dead_code)
+    )]
+    Cpu,
 }
 
-pub fn metal_host_supported(macos: bool, aarch64: bool) -> bool {
-    macos && aarch64
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Metal => "metal",
+            Backend::Vulkan => "vulkan",
+            Backend::Cpu => "cpu",
+        }
+    }
+}
+
+pub fn compiled_backend_name() -> &'static str {
+    compiled_backend().name()
+}
+
+pub fn compiled_backend() -> Backend {
+    #[cfg(target_os = "macos")]
+    {
+        return Backend::Metal;
+    }
+    #[cfg(all(target_os = "linux", feature = "vulkan", not(feature = "cpu")))]
+    {
+        return Backend::Vulkan;
+    }
+    #[cfg(all(target_os = "linux", feature = "cpu", not(feature = "vulkan")))]
+    {
+        return Backend::Cpu;
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", feature = "vulkan", not(feature = "cpu")),
+        all(target_os = "linux", feature = "cpu", not(feature = "vulkan")),
+    )))]
+    {
+        // `lib.rs` rejects this host or this pair of features.
+        unreachable!("unsupported host or backend features")
+    }
+}
+
+pub fn host_backend_supported(os: &str, arch: &str, backend: Backend) -> bool {
+    match backend {
+        Backend::Metal => os == "macos" && arch == "aarch64",
+        Backend::Vulkan | Backend::Cpu => os == "linux" && arch == "x86_64",
+    }
+}
+
+fn unsupported_host(backend: Backend) -> Error {
+    let message = match backend {
+        Backend::Metal => "llama.cpp Metal backend requires macOS on Apple Silicon",
+        Backend::Vulkan => "llama.cpp Vulkan backend requires Linux x86_64",
+        Backend::Cpu => "llama.cpp CPU backend requires Linux x86_64",
+    };
+    Error::new(message)
+}
+
+fn require_offload(backend: &LlamaBackend, scoring: Backend) -> Result<(), Error> {
+    match scoring {
+        Backend::Cpu => Ok(()),
+        Backend::Metal => {
+            if backend.supports_gpu_offload() {
+                Ok(())
+            } else {
+                Err(Error::new("llama.cpp Metal GPU offload is unavailable"))
+            }
+        }
+        Backend::Vulkan => {
+            let gpu = llama_cpp_2::list_llama_ggml_backend_devices()
+                .iter()
+                .any(|device| device.device_type == llama_cpp_2::LlamaBackendDeviceType::Gpu);
+            if backend.supports_gpu_offload() && gpu {
+                Ok(())
+            } else {
+                Err(Error::new("no usable Vulkan GPU"))
+            }
+        }
+    }
+}
+
+fn model_params(scoring: Backend) -> LlamaModelParams {
+    match scoring {
+        // Default n_gpu_layers is -1, which offloads every layer.
+        Backend::Metal | Backend::Vulkan => LlamaModelParams::default(),
+        Backend::Cpu => LlamaModelParams::default().with_n_gpu_layers(0),
+    }
+}
+
+fn offloaded_layers(model: &LlamaModel, scoring: Backend) -> u32 {
+    match scoring {
+        Backend::Metal | Backend::Vulkan => model.n_layer(),
+        Backend::Cpu => 0,
+    }
 }
 
 fn hash_file(path: &Path) -> Result<(String, u64), Error> {
@@ -395,10 +504,26 @@ mod tests {
     }
 
     #[test]
-    fn metal_host_is_macos_arm64() {
-        assert!(metal_host_supported(true, true));
-        assert!(!metal_host_supported(false, true));
-        assert!(!metal_host_supported(true, false));
+    fn host_matches_the_compiled_backend() {
+        let cases = [
+            ("macos", "aarch64", Backend::Metal, true),
+            ("macos", "x86_64", Backend::Metal, false),
+            ("linux", "aarch64", Backend::Metal, false),
+            ("linux", "x86_64", Backend::Vulkan, true),
+            ("linux", "aarch64", Backend::Vulkan, false),
+            ("macos", "aarch64", Backend::Vulkan, false),
+            ("linux", "x86_64", Backend::Cpu, true),
+            ("linux", "aarch64", Backend::Cpu, false),
+            ("macos", "x86_64", Backend::Cpu, false),
+            ("macos", "aarch64", Backend::Cpu, false),
+        ];
+        for (os, arch, backend, supported) in cases {
+            assert_eq!(
+                host_backend_supported(os, arch, backend),
+                supported,
+                "{os} {arch} {backend:?}"
+            );
+        }
     }
 
     #[test]

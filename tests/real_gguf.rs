@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use semif_score::load_model;
+use semif_score::{compiled_backend_name, load_model};
 use serde_json::json;
 
 #[test]
@@ -67,8 +67,13 @@ fn real_gguf_scores_direct() {
         })
         .collect::<Vec<_>>();
     assert_eq!(choices, ["yes", "yes"]);
-    assert_eq!(metadata["backend"], "llamacpp-metal");
-    assert!(metadata["n_gpu_layers"].as_u64().unwrap() >= 1);
+    let backend_name = compiled_backend_name();
+    assert_eq!(metadata["backend"], format!("llamacpp-{backend_name}"));
+    if backend_name == "cpu" {
+        assert_eq!(metadata["n_gpu_layers"], 0);
+    } else {
+        assert!(metadata["n_gpu_layers"].as_u64().unwrap() >= 1);
+    }
     assert_eq!(metadata["max_prompt_tokens"], 4096);
     assert!(
         metadata["context_tokens"].as_u64().unwrap()

@@ -1,12 +1,12 @@
 # libre-semif-rs
 
-This is Jev-like semantic decision service, inspired by [SemIf-OpenJev](https://github.com/TheoLeeCJ/SemIf-OpenJev). Prompt construction, row checks, and the JSONL record follow that project's direct mode (`direct-options-v1`, matching `encode_prompt` in `src/semif_phase1/direct.py`). This crate implements only that path, on Apple Silicon Metal through llama.cpp.
+This is Jev-like semantic decision service, inspired by [SemIf-OpenJev](https://github.com/TheoLeeCJ/SemIf-OpenJev). Prompt construction, row checks, and the JSONL record follow that project's direct mode (`direct-options-v1`, matching `encode_prompt` in `src/semif_phase1/direct.py`). This crate implements only that path through llama.cpp: Metal on Apple Silicon, and Vulkan or CPU on Linux x86_64.
 
 `libre-semif-rs` reads JSONL decisions and writes a new JSONL of option probabilities. No answer text is generated.
 
 ## Usage
 
-Requires macOS on Apple Silicon. Every layer is offloaded to Metal. `--mode` accepts only `direct`. The output file must not already exist. Prompts are never truncated; `--max-tokens` (default 4096) is a hard limit.
+On macOS the host must be Apple Silicon and every layer is offloaded to Metal. On Linux x86_64 the default build offloads every layer to Vulkan and refuses to run without a Vulkan GPU. A CPU-only Linux build runs every layer on the CPU. `--mode` accepts only `direct`. The output file must not already exist. Prompts are never truncated; `--max-tokens` (default 4096) is a hard limit.
 
 ```bash
 libre-semif-rs \
@@ -28,6 +28,26 @@ Each input line is one row: `id`, `state` (nonempty string, object, or array), `
 
 Each result line includes `probabilities`, `option_logits`, `prompt_sha256`, `prompt_version`, and model metadata (source, revision, GGUF checksum, backend). Probabilities are conditional on the declared options and uncalibrated as decision confidence.
 
+## Building
+
+macOS uses Metal. The `vulkan` and `cpu` features apply on Linux; a macOS build uses Metal either way.
+
+```bash
+cargo build --release
+```
+
+Linux x86_64 uses Vulkan by default. That build needs CMake, a C++ toolchain, the Vulkan headers and loader, `glslc`, and libgomp:
+
+```bash
+cargo build --release
+```
+
+CPU-only, still with OpenMP. This build needs CMake, a C++ toolchain, and libgomp:
+
+```bash
+cargo build --release --no-default-features --features cpu
+```
+
 ## Scoring
 
 1. Build a system message plus a user payload of evidence, criterion, and options labeled `A`–`P`.
@@ -38,7 +58,7 @@ Each result line includes `probabilities`, `option_logits`, `prompt_sha256`, `pr
 ## Layout
 
 - `cli` — JSONL in, create-only JSONL out.
-- `loader` — pinned tokenizer and local GGUF, one Metal context.
+- `loader` — pinned tokenizer and local GGUF, one llama.cpp context.
 - `prompt` — chat-template render and answer-slot checks (`direct-options-v1`).
 - `engine` — last-position logits; no generated tokens.
 - `score` — slot logits, softmax, and the result record.
